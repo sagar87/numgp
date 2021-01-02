@@ -45,41 +45,58 @@ class Base:
 
 
 class Marginal(Base):
-    def __init__(self, X, y, mean_func=Zero, cov_func=Constant, noise_func=WhiteNoise):
-        super().__init__(mean_func=mean_func, cov_func=cov_func)
-        self.noise_func = noise_func
-        self.X = X
-        self.y = y
+    R"""
+    Marginal Gaussian process.
+    The `gp.Marginal` class is an implementation of the sum of a GP
+    prior and additive noise.  It has `marginal_likelihood`, `conditional`
+    and `predict` methods.  This GP implementation can be used to
+    implement regression on data that is normally distributed.  For more
+    information on the `prior` and `conditional` methods, see their docstrings.
+    Parameters
+    ----------
+    cov_func: None, 2D array, or instance of Covariance
+        The covariance function.  Defaults to zero.
+    mean_func: None, instance of Mean
+        The mean function.  Defaults to zero.
+    Examples
+    --------
+    .. code:: python
+        # A one dimensional column vector of inputs.
+        X = np.linspace(0, 1, 10)[:, None]
+        with pm.Model() as model:
+            # Specify the covariance function.
+            cov_func = pm.gp.cov.ExpQuad(1, ls=0.1)
+            # Specify the GP.  The default mean function is `Zero`.
+            gp = pm.gp.Marginal(cov_func=cov_func)
+            # Place a GP prior over the function f.
+            sigma = pm.HalfCauchy("sigma", beta=3)
+            y_ = gp.marginal_likelihood("y", X=X, y=y, noise=sigma)
+        ...
+        # After fitting or sampling, specify the distribution
+        # at new points with .conditional
+        Xnew = np.linspace(-1, 2, 50)[:, None]
+        with model:
+            fcond = gp.conditional("fcond", Xnew=Xnew)
+    """
 
-        self.cov_kwargs = [
-            a for a in inspect.getfullargspec(cov_func).args if a != "self"
-        ]
-        self.noise_kwargs = [
-            a for a in inspect.getfullargspec(noise_func).args if a != "self"
-        ]
-        self.mean_kwargs = [
-            a for a in inspect.getfullargspec(mean_func).args if a != "self"
-        ]
+    def __init__(self, name, mean_func=Zero(), cov_func=Constant(0.0)):
+        super().__init__(mean_func, cov_func)
+        self.name = name
 
-    def marginal_likelihood(
-        self,
-        mean_args=(),
-        cov_args=(),
-        noise_args=(),
-        mean_kwargs={},
-        cov_kwargs={},
-        noise_kwargs={},
-    ):
+    def _build_marginal_likelihood(self, X):
+        mu = npy.deterministic(f"{self.name}_mean", self.mean_func(X))
+        Kxx = npy.deterministic(f"{self.name}_Kxx", self.cov_func(X))
+        Knx = npy.deterministic(f"{self.name}_Knx", self.noise(X))
+        cov = Kxx + Knx
+        return mu, cov
+
+    def marginal_likelihood(self, X, y, noise, is_observed=True, **kwargs):
         R"""
         Returns the marginal likelihood distribution, given the input
         locations `X` and the data `y`.
-
         This is integral over the product of the GP prior and a normal likelihood.
-
         .. math::
-
            y \mid X,\theta \sim \int p(y \mid f,\, X,\, \theta) \, p(f \mid X,\, \theta) \, df
-
         Parameters
         ----------
         name: string
@@ -101,122 +118,54 @@ class Marginal(Base):
             constructor.
         """
 
-        mu = self.mean_func(*mean_args, **mean_kwargs)(self.X)
-        Kxx = self.cov_func(*cov_args, **cov_kwargs)(self.X)
-        Knx = self.noise_func(*noise_args, **noise_kwargs)(self.X)
-        cov = Kxx + Knx
-
-        return mu, cov
-
-    def _build_conditional(
-        self, Xnew, pred_noise, diag, X, y, noise, cov_total, mean_total
-    ):
-        Kxx = cov_total(X)
-        Kxs = self.cov_func(X, Xnew)
-        Knx = noise(X)
-        rxx = y - mean_total(X)
-        L = cholesky(stabilize(Kxx) + Knx)
-        A = solve_lower(L, Kxs)
-        v = solve_lower(L, rxx)
-        mu = self.mean_func(Xnew) + tt.dot(tt.transpose(A), v)
-        if diag:
-            Kss = self.cov_func(Xnew, diag=True)
-            var = Kss - tt.sum(tt.square(A), 0)
-            if pred_noise:
-                var += noise(Xnew, diag=True)
-            return mu, var
+        if not isinstance(noise, Covariance):
+            self.noise = WhiteNoise(noise)
         else:
-            Kss = self.cov_func(Xnew)
-            cov = Kss - tt.dot(tt.transpose(A), A)
-            if pred_noise:
-                cov += noise(Xnew)
-            return mu, cov if pred_noise else stabilize(cov)
+            self.noise = noise
 
-    def conditional(self, Xnew, posterior, **kwargs):
-        def _predict(X, Y, X_test, *args):
-            i, j, k = (
-                len(self.mean_kwargs),
-                len(self.cov_kwargs),
-                len(self.noise_kwargs),
+        mu, cov = self._build_marginal_likelihood(X)
+        _ = npy.deterministic(f"{self.name}_y", y)
+
+        if is_observed:
+            return npy.sample(
+                f"{self.name}",
+                dist.MultivariateNormal(loc=mu, covariance_matrix=cov),
+                obs=y,
             )
-            mean_args = args[:i]
-            cov_args = args[i : i + j]
-            noise_args = args[i + j : i + j + k]
-            rng_key = args[i + j + k]
-
-            mean_func = self.mean_func(*mean_args)
-            cov_func = self.cov_func(*cov_args)
-            noise_func = self.noise_func(*noise_args)
-
-            # compute kernels between train and test data, etc.
-            k_pp = cov_func(X_test, X_test) + noise_func(
-                X_test
-            )  # kernel(X_test, X_test, var, length, noise, include_noise=True)
-            k_pX = cov_func(
-                X_test, X
-            )  # kernel(X_test, X, var, length, noise, include_noise=False)
-            k_XX = cov_func(X, X) + noise_func(
-                X
-            )  # kernel(X, X, var, length, noise, include_noise=True)
-            K_xx_inv = jnp.linalg.inv(k_XX)
-            K = k_pp - jnp.matmul(k_pX, jnp.matmul(K_xx_inv, jnp.transpose(k_pX)))
-            sigma_noise = jnp.sqrt(
-                jnp.clip(jnp.diag(K), a_min=0.0)
-            ) * jax.random.normal(rng_key, X_test.shape[:1])
-            mean = jnp.matmul(k_pX, jnp.matmul(K_xx_inv, Y))
-            # we return both the mean function and a sample from the posterior predictive for the
-            # given set of hyperparameters
-            return mean, mean + sigma_noise
-
-        mean_param = [posterior[k] for k in self.mean_kwargs]
-        cov_param = [posterior[k] for k in self.cov_kwargs]
-        noise_param = [posterior[k] for k in self.noise_kwargs]
-
-        rng_key, rng_key_predict = random.split(random.PRNGKey(5))
-        keys = random.split(rng_key_predict, cov_param[0].shape[0])
-        self.vmap_args = [*mean_param, *cov_param, *noise_param, keys]
-
-        self.means, self.covs = vmap(
-            lambda *args: _predict(self.X, self.y, Xnew, *args)
-        )(*self.vmap_args)
-
-    def conditional2(self, Xnew, posterior):
-        def _predict(X, y, Xnew, *args):
-            i, j, k = (
-                len(self.mean_kwargs),
-                len(self.cov_kwargs),
-                len(self.noise_kwargs),
+        else:
+            shape = infer_shape(X, kwargs.pop("shape", None))
+            return npy.sample(
+                f"{self.name}", dist.MultivariateNormal(loc=mu, covariance_matrix=cov)
             )
-            mean_args = args[:i]
-            cov_args = args[i : i + j]
-            noise_args = args[i + j :]
 
-            mean_func = self.mean_func(*mean_args)
-            cov_func = self.cov_func(*cov_args)
-            noise_func = self.noise_func(*noise_args)
+    def _get_given_vals(self, given):
+        if given is None:
+            given = {}
 
-            Kxx = cov_func(X) + noise_func(X)
-            Kxs = cov_func(X, Xnew)
-            Knx = noise_func(X)
+        if "gp" in given:
+            cov_total = given["gp"].cov_func
+            mean_total = given["gp"].mean_func
+        else:
+            cov_total = self.cov_func
+            mean_total = self.mean_func
+        if all(val in given for val in ["X", "y", "noise"]):
+            X, y, noise = given["X"], given["y"], given["noise"]
+            if not isinstance(noise, Covariance):
+                noise = pm.gp.cov.WhiteNoise(noise)
+        else:
+            X, y, noise = self.X, self.y, self.noise
+        return X, y, noise, cov_total, mean_total
 
-            rxx = y - mean_func(X)
-            L = cholesky(stabilize(Kxx) + Knx)
-            A = solve_lower(L, Kxs)
-            v = solve_lower(L, rxx)
-            mu = mean_func(Xnew) + A.T @ v
+    def _build_conditional(self, X=None, Xnew=None):
+        # sets deterministic sites to sample from the condtional
+        npy.deterministic(f"{self.name}_Kss", self.cov_func(Xnew))
+        npy.deterministic(f"{self.name}_Kns", self.cov_func(Xnew))
+        npy.deterministic(f"{self.name}_Ksx", self.cov_func(Xnew, X))
+        npy.deterministic(f"{self.name}_cond", self.mean_func(Xnew))
 
-            Kss = cov_func(Xnew)
-            cov = Kss - A.T @ A
-            return mu, cov
-
-        mean_param = [posterior[k] for k in self.mean_kwargs]
-        cov_param = [posterior[k] for k in self.cov_kwargs]
-        noise_param = [posterior[k] for k in self.noise_kwargs]
-
-        self.vmap_args = [*mean_param, *cov_param, *noise_param]
-        self.means, self.covs = vmap(
-            lambda *args: _predict(self.X, self.y, Xnew, *args)
-        )(*self.vmap_args)
+    def conditional(self, X=None, Xnew=None):
+        self._build_conditional(X, Xnew)
+        return None
 
 
 class LatentKron(Base):

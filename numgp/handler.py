@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import numpyro as npy
 import pandas as pd
-from jax import lax, random
+from jax import lax, random, jit
 from jax.numpy import DeviceArray
 from numpyro import optim
 from numpyro.diagnostics import hpdi

@@ -16,7 +16,7 @@ from jax.config import config
 config.update("jax_enable_x64", True)
 
 from . import cov, handler, math, mean, util
-from .conditional import LatentKronConditional
+from .conditional import LatentKronConditional, MarginalConditional
 from .gp import LatentKron, Marginal
 
 # from .gp import TP, Latent, LatentKron, Marginal, MarginalKron, MarginalSparse
